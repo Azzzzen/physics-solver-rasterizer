@@ -111,7 +111,6 @@ void GpuPhysicsSolver::step(float dt) {
         glUniform1f(glGetUniformLocation(m_computeProgram, "uDamping"), m_damping);
         glUniform1f(glGetUniformLocation(m_computeProgram, "uSpringDamping"), m_springDamping);
         glUniform1f(glGetUniformLocation(m_computeProgram, "uMaxSpeed"), m_maxSpeed);
-        glUniform1f(glGetUniformLocation(m_computeProgram, "uMaxStretchRatio"), m_maxStretchRatio);
         glUniform1f(glGetUniformLocation(m_computeProgram, "uGroundY"), m_groundY);
         glUniform3f(glGetUniformLocation(m_computeProgram, "uGravity"), m_gravity.x, m_gravity.y, m_gravity.z);
         glUniform3f(glGetUniformLocation(m_computeProgram, "uWind"), m_wind.x, m_wind.y, m_wind.z);

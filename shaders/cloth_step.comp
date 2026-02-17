@@ -28,7 +28,6 @@ uniform float uStiffness;
 uniform float uDamping;
 uniform float uSpringDamping;
 uniform float uMaxSpeed;
-uniform float uMaxStretchRatio;
 uniform float uGroundY;
 uniform vec3 uGravity;
 uniform vec3 uWind;
@@ -47,11 +46,15 @@ float springRestLength(int dr, int dc) {
     return uSpacing * 2.0;
 }
 
-bool isLocked(int idx) {
-    return fixedFlags[idx] != 0 || idx == uDraggedIndex;
-}
-
-void addSpringForce(inout vec3 force, int idx, int r, int c, int nr, int nc, vec3 p, vec3 v) {
+void addImplicitSpring(
+    inout mat3 A,
+    inout vec3 rhs,
+    int r,
+    int c,
+    int nr,
+    int nc,
+    vec3 p,
+    vec3 v) {
     if (nr < 0 || nr >= uRows || nc < 0 || nc >= uCols) {
         return;
     }
@@ -69,44 +72,14 @@ void addSpringForce(inout vec3 force, int idx, int r, int c, int nr, int nc, vec
     vec3 dir = delta / len;
     float rest = springRestLength(nr - r, nc - c);
     float stretch = len - rest;
-    float damp = dot(v - nv, dir) * uSpringDamping;
-    vec3 springForce = (-uStiffness * stretch - damp) * dir;
-    force += springForce;
-}
 
-void applyStrainLimit(inout vec3 p, int idx, int r, int c, int nr, int nc) {
-    if (nr < 0 || nr >= uRows || nc < 0 || nc >= uCols) {
-        return;
-    }
+    vec3 fPos = (-uStiffness * stretch) * dir;
+    rhs += uDt * fPos;
 
-    int nidx = nr * uCols + nc;
-    vec3 np = posIn[nidx].xyz;
-    vec3 delta = p - np;
-    float len = length(delta);
-    if (len <= 1e-6) {
-        return;
-    }
-
-    float rest = springRestLength(nr - r, nc - c);
-    float maxLen = rest * uMaxStretchRatio;
-    if (len <= maxLen) {
-        return;
-    }
-
-    vec3 dir = delta / len;
-    vec3 correction = (len - maxLen) * dir;
-
-    bool lockSelf = isLocked(idx);
-    bool lockNeighbor = isLocked(nidx);
-
-    if (lockSelf) {
-        return;
-    }
-    if (lockNeighbor) {
-        p -= correction;
-    } else {
-        p -= 0.5 * correction;
-    }
+    float coupling = uDt * uDt * uStiffness + uDt * uSpringDamping;
+    mat3 P = outerProduct(dir, dir);
+    A += coupling * P;
+    rhs += coupling * (P * nv);
 }
 
 void main() {
@@ -134,53 +107,39 @@ void main() {
     int r = idx / uCols;
     int c = idx - r * uCols;
 
-    vec3 force = uGravity * uMass + uWind - uDamping * v;
+    float diag = uMass + uDt * uDamping;
+    mat3 A = mat3(diag, 0.0, 0.0, 0.0, diag, 0.0, 0.0, 0.0, diag);
+    vec3 rhs = uMass * v + uDt * (uMass * uGravity + uWind);
 
-    addSpringForce(force, idx, r, c, r, c - 1, p, v);
-    addSpringForce(force, idx, r, c, r, c + 1, p, v);
-    addSpringForce(force, idx, r, c, r - 1, c, p, v);
-    addSpringForce(force, idx, r, c, r + 1, c, p, v);
+    addImplicitSpring(A, rhs, r, c, r, c - 1, p, v);
+    addImplicitSpring(A, rhs, r, c, r, c + 1, p, v);
+    addImplicitSpring(A, rhs, r, c, r - 1, c, p, v);
+    addImplicitSpring(A, rhs, r, c, r + 1, c, p, v);
 
-    addSpringForce(force, idx, r, c, r - 1, c - 1, p, v);
-    addSpringForce(force, idx, r, c, r - 1, c + 1, p, v);
-    addSpringForce(force, idx, r, c, r + 1, c - 1, p, v);
-    addSpringForce(force, idx, r, c, r + 1, c + 1, p, v);
+    addImplicitSpring(A, rhs, r, c, r - 1, c - 1, p, v);
+    addImplicitSpring(A, rhs, r, c, r - 1, c + 1, p, v);
+    addImplicitSpring(A, rhs, r, c, r + 1, c - 1, p, v);
+    addImplicitSpring(A, rhs, r, c, r + 1, c + 1, p, v);
 
-    addSpringForce(force, idx, r, c, r, c - 2, p, v);
-    addSpringForce(force, idx, r, c, r, c + 2, p, v);
-    addSpringForce(force, idx, r, c, r - 2, c, p, v);
-    addSpringForce(force, idx, r, c, r + 2, c, p, v);
+    addImplicitSpring(A, rhs, r, c, r, c - 2, p, v);
+    addImplicitSpring(A, rhs, r, c, r, c + 2, p, v);
+    addImplicitSpring(A, rhs, r, c, r - 2, c, p, v);
+    addImplicitSpring(A, rhs, r, c, r + 2, c, p, v);
 
-    vec3 a = force / uMass;
-    v += a * uDt;
+    vec3 vNew = inverse(A) * rhs;
 
-    float speed = length(v);
+    float speed = length(vNew);
     if (speed > uMaxSpeed) {
-        v *= uMaxSpeed / speed;
+        vNew *= uMaxSpeed / speed;
     }
 
-    p += v * uDt;
+    vec3 pNew = p + uDt * vNew;
 
-    applyStrainLimit(p, idx, r, c, r, c - 1);
-    applyStrainLimit(p, idx, r, c, r, c + 1);
-    applyStrainLimit(p, idx, r, c, r - 1, c);
-    applyStrainLimit(p, idx, r, c, r + 1, c);
-
-    applyStrainLimit(p, idx, r, c, r - 1, c - 1);
-    applyStrainLimit(p, idx, r, c, r - 1, c + 1);
-    applyStrainLimit(p, idx, r, c, r + 1, c - 1);
-    applyStrainLimit(p, idx, r, c, r + 1, c + 1);
-
-    applyStrainLimit(p, idx, r, c, r, c - 2);
-    applyStrainLimit(p, idx, r, c, r, c + 2);
-    applyStrainLimit(p, idx, r, c, r - 2, c);
-    applyStrainLimit(p, idx, r, c, r + 2, c);
-
-    if (p.y < uGroundY) {
-        p.y = uGroundY;
-        v.y *= -0.15;
+    if (pNew.y < uGroundY) {
+        pNew.y = uGroundY;
+        vNew.y *= -0.15;
     }
 
-    posOut[idx] = vec4(p, 0.0);
-    velOut[idx] = vec4(v, 0.0);
+    posOut[idx] = vec4(pNew, 0.0);
+    velOut[idx] = vec4(vNew, 0.0);
 }
