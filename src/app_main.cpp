@@ -232,12 +232,6 @@ int main() {
 
         glEnable(GL_DEPTH_TEST);
 
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGui::StyleColorsDark();
-        ImGui_ImplGlfw_InitForOpenGL(window, true);
-        ImGui_ImplOpenGL3_Init("#version 330");
-
         const std::size_t rows = 35;
         const std::size_t cols = 35;
         const float spacing = 0.05f;
@@ -248,6 +242,19 @@ int main() {
         Shader shadingShader("shaders/vertex.glsl", "shaders/fragment.glsl");
         Shader depthShader("shaders/shadow_depth_vertex.glsl", "shaders/shadow_depth_fragment.glsl");
         Camera camera(static_cast<float>(kWindowWidth) / static_cast<float>(kWindowHeight));
+
+        AppContext appContext;
+        appContext.camera = &camera;
+        glfwSetWindowUserPointer(window, &appContext);
+        glfwSetFramebufferSizeCallback(window, frameBufferSizeCallback);
+        glfwSetCursorPosCallback(window, cursorPosCallback);
+        glfwSetScrollCallback(window, scrollCallback);
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::StyleColorsDark();
+        ImGui_ImplGlfw_InitForOpenGL(window, true);
+        ImGui_ImplOpenGL3_Init("#version 330");
 
         auto cubeMesh = std::make_shared<Mesh>(buildUnitCubeVertices(), buildUnitCubeIndices(), false);
 
@@ -284,13 +291,6 @@ int main() {
         glDrawBuffer(GL_NONE);
         glReadBuffer(GL_NONE);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        AppContext appContext;
-        appContext.camera = &camera;
-        glfwSetWindowUserPointer(window, &appContext);
-        glfwSetFramebufferSizeCallback(window, frameBufferSizeCallback);
-        glfwSetCursorPosCallback(window, cursorPosCallback);
-        glfwSetScrollCallback(window, scrollCallback);
 
         int fbWidth = 0;
         int fbHeight = 0;
