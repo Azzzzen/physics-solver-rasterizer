@@ -1,3 +1,0 @@
-/home/qiyu_tan/project/build/CMakeFiles/cloth_rasterizer.dir
-/home/qiyu_tan/project/build/CMakeFiles/edit_cache.dir
-/home/qiyu_tan/project/build/CMakeFiles/rebuild_cache.dir
