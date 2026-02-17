@@ -1,0 +1,186 @@
+#version 430 core
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer PosInBuffer {
+    vec4 posIn[];
+};
+layout(std430, binding = 1) readonly buffer VelInBuffer {
+    vec4 velIn[];
+};
+layout(std430, binding = 2) writeonly buffer PosOutBuffer {
+    vec4 posOut[];
+};
+layout(std430, binding = 3) writeonly buffer VelOutBuffer {
+    vec4 velOut[];
+};
+layout(std430, binding = 4) readonly buffer FixedBuffer {
+    int fixedFlags[];
+};
+
+uniform int uRows;
+uniform int uCols;
+uniform int uNumParticles;
+uniform float uDt;
+uniform float uSpacing;
+uniform float uMass;
+uniform float uStiffness;
+uniform float uDamping;
+uniform float uSpringDamping;
+uniform float uMaxSpeed;
+uniform float uMaxStretchRatio;
+uniform float uGroundY;
+uniform vec3 uGravity;
+uniform vec3 uWind;
+uniform int uDraggedIndex;
+uniform vec3 uDragTarget;
+
+float springRestLength(int dr, int dc) {
+    int adr = abs(dr);
+    int adc = abs(dc);
+    if ((adr == 1 && adc == 0) || (adr == 0 && adc == 1)) {
+        return uSpacing;
+    }
+    if (adr == 1 && adc == 1) {
+        return uSpacing * 1.41421356237;
+    }
+    return uSpacing * 2.0;
+}
+
+bool isLocked(int idx) {
+    return fixedFlags[idx] != 0 || idx == uDraggedIndex;
+}
+
+void addSpringForce(inout vec3 force, int idx, int r, int c, int nr, int nc, vec3 p, vec3 v) {
+    if (nr < 0 || nr >= uRows || nc < 0 || nc >= uCols) {
+        return;
+    }
+
+    int nidx = nr * uCols + nc;
+    vec3 np = posIn[nidx].xyz;
+    vec3 nv = velIn[nidx].xyz;
+
+    vec3 delta = p - np;
+    float len = length(delta);
+    if (len <= 1e-6) {
+        return;
+    }
+
+    vec3 dir = delta / len;
+    float rest = springRestLength(nr - r, nc - c);
+    float stretch = len - rest;
+    float damp = dot(v - nv, dir) * uSpringDamping;
+    vec3 springForce = (-uStiffness * stretch - damp) * dir;
+    force += springForce;
+}
+
+void applyStrainLimit(inout vec3 p, int idx, int r, int c, int nr, int nc) {
+    if (nr < 0 || nr >= uRows || nc < 0 || nc >= uCols) {
+        return;
+    }
+
+    int nidx = nr * uCols + nc;
+    vec3 np = posIn[nidx].xyz;
+    vec3 delta = p - np;
+    float len = length(delta);
+    if (len <= 1e-6) {
+        return;
+    }
+
+    float rest = springRestLength(nr - r, nc - c);
+    float maxLen = rest * uMaxStretchRatio;
+    if (len <= maxLen) {
+        return;
+    }
+
+    vec3 dir = delta / len;
+    vec3 correction = (len - maxLen) * dir;
+
+    bool lockSelf = isLocked(idx);
+    bool lockNeighbor = isLocked(nidx);
+
+    if (lockSelf) {
+        return;
+    }
+    if (lockNeighbor) {
+        p -= correction;
+    } else {
+        p -= 0.5 * correction;
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(uNumParticles)) {
+        return;
+    }
+
+    int idx = int(gid);
+    vec3 p = posIn[idx].xyz;
+    vec3 v = velIn[idx].xyz;
+
+    if (fixedFlags[idx] != 0) {
+        posOut[idx] = vec4(p, 0.0);
+        velOut[idx] = vec4(0.0);
+        return;
+    }
+
+    if (idx == uDraggedIndex) {
+        posOut[idx] = vec4(uDragTarget, 0.0);
+        velOut[idx] = vec4(0.0);
+        return;
+    }
+
+    int r = idx / uCols;
+    int c = idx - r * uCols;
+
+    vec3 force = uGravity * uMass + uWind - uDamping * v;
+
+    addSpringForce(force, idx, r, c, r, c - 1, p, v);
+    addSpringForce(force, idx, r, c, r, c + 1, p, v);
+    addSpringForce(force, idx, r, c, r - 1, c, p, v);
+    addSpringForce(force, idx, r, c, r + 1, c, p, v);
+
+    addSpringForce(force, idx, r, c, r - 1, c - 1, p, v);
+    addSpringForce(force, idx, r, c, r - 1, c + 1, p, v);
+    addSpringForce(force, idx, r, c, r + 1, c - 1, p, v);
+    addSpringForce(force, idx, r, c, r + 1, c + 1, p, v);
+
+    addSpringForce(force, idx, r, c, r, c - 2, p, v);
+    addSpringForce(force, idx, r, c, r, c + 2, p, v);
+    addSpringForce(force, idx, r, c, r - 2, c, p, v);
+    addSpringForce(force, idx, r, c, r + 2, c, p, v);
+
+    vec3 a = force / uMass;
+    v += a * uDt;
+
+    float speed = length(v);
+    if (speed > uMaxSpeed) {
+        v *= uMaxSpeed / speed;
+    }
+
+    p += v * uDt;
+
+    applyStrainLimit(p, idx, r, c, r, c - 1);
+    applyStrainLimit(p, idx, r, c, r, c + 1);
+    applyStrainLimit(p, idx, r, c, r - 1, c);
+    applyStrainLimit(p, idx, r, c, r + 1, c);
+
+    applyStrainLimit(p, idx, r, c, r - 1, c - 1);
+    applyStrainLimit(p, idx, r, c, r - 1, c + 1);
+    applyStrainLimit(p, idx, r, c, r + 1, c - 1);
+    applyStrainLimit(p, idx, r, c, r + 1, c + 1);
+
+    applyStrainLimit(p, idx, r, c, r, c - 2);
+    applyStrainLimit(p, idx, r, c, r, c + 2);
+    applyStrainLimit(p, idx, r, c, r - 2, c);
+    applyStrainLimit(p, idx, r, c, r + 2, c);
+
+    if (p.y < uGroundY) {
+        p.y = uGroundY;
+        v.y *= -0.15;
+    }
+
+    posOut[idx] = vec4(p, 0.0);
+    velOut[idx] = vec4(v, 0.0);
+}

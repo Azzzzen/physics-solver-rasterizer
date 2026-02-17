@@ -1,8 +1,11 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <GL/glew.h>
@@ -15,6 +18,7 @@
 #include <backends/imgui_impl_opengl3.h>
 
 #include "Camera.h"
+#include "GpuPhysicsSolver.h"
 #include "Mesh.h"
 #include "PhysicsSolver.h"
 #include "Shader.h"
@@ -210,14 +214,19 @@ int main() {
             throw std::runtime_error("Failed to initialize GLFW");
         }
 
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
         GLFWwindow* window = glfwCreateWindow(kWindowWidth, kWindowHeight, "Cloth Lab", nullptr, nullptr);
         if (window == nullptr) {
-            glfwTerminate();
-            throw std::runtime_error("Failed to create GLFW window");
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+            window = glfwCreateWindow(kWindowWidth, kWindowHeight, "Cloth Lab", nullptr, nullptr);
+            if (window == nullptr) {
+                glfwTerminate();
+                throw std::runtime_error("Failed to create GLFW window");
+            }
         }
 
         glfwMakeContextCurrent(window);
@@ -236,12 +245,26 @@ int main() {
         const std::size_t cols = 35;
         const float spacing = 0.05f;
 
-        PhysicsSolver solver(rows, cols, spacing);
-        Mesh clothMesh(rows, cols, solver.getPositions());
+        PhysicsSolver cpuSolver(rows, cols, spacing);
+        Mesh clothMesh(rows, cols, cpuSolver.getPositions());
 
         Shader shadingShader("shaders/vertex.glsl", "shaders/fragment.glsl");
         Shader depthShader("shaders/shadow_depth_vertex.glsl", "shaders/shadow_depth_fragment.glsl");
         Camera camera(static_cast<float>(kWindowWidth) / static_cast<float>(kWindowHeight));
+
+        std::unique_ptr<GpuPhysicsSolver> gpuSolver;
+        bool gpuAvailable = false;
+        std::string gpuInitError;
+        if (GLEW_VERSION_4_3) {
+            try {
+                gpuSolver = std::make_unique<GpuPhysicsSolver>(rows, cols, spacing);
+                gpuAvailable = true;
+            } catch (const std::exception& e) {
+                gpuInitError = e.what();
+            }
+        } else {
+            gpuInitError = "OpenGL 4.3 compute shader is unavailable on this context";
+        }
 
         AppContext appContext;
         appContext.camera = &camera;
@@ -306,6 +329,21 @@ int main() {
         bool rPressedLastFrame = false;
 
         bool leftMouseHeld = false;
+        bool useGpuSolver = gpuAvailable;
+
+        float stiffness = cpuSolver.getStiffness();
+        float damping = cpuSolver.getDamping();
+        float gravity = cpuSolver.getGravityScale();
+        float wind = cpuSolver.getWindStrength();
+
+        double cpuStepMs = 0.0;
+        double gpuStepMs = 0.0;
+        double cpuGpuRmse = 0.0;
+        double compareAccumSec = 0.0;
+        double compareAccumCpuMs = 0.0;
+        double compareAccumGpuMs = 0.0;
+        double compareAccumRmse = 0.0;
+        int compareSamples = 0;
 
         float lastTime = static_cast<float>(glfwGetTime());
 
@@ -345,34 +383,86 @@ int main() {
 
             const bool rPressed = glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
             if (rPressed && !rPressedLastFrame) {
-                solver.reset();
-                clothMesh.updatePositions(solver.getPositions());
+                cpuSolver.reset();
+                cpuSolver.setStiffness(stiffness);
+                cpuSolver.setDamping(damping);
+                cpuSolver.setGravityScale(gravity);
+                cpuSolver.setWindStrength(wind);
+
+                if (gpuAvailable) {
+                    gpuSolver->reset();
+                    gpuSolver->setStiffness(stiffness);
+                    gpuSolver->setDamping(damping);
+                    gpuSolver->setGravityScale(gravity);
+                    gpuSolver->setWindStrength(wind);
+                }
+
+                const std::vector<glm::vec3>& resetPositions =
+                    (useGpuSolver && gpuAvailable) ? gpuSolver->getPositions() : cpuSolver.getPositions();
+                clothMesh.updatePositions(resetPositions);
             }
             rPressedLastFrame = rPressed;
 
             if (showHud) {
                 ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(340.0f, 240.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(360.0f, 320.0f), ImGuiCond_Always);
                 ImGui::Begin("Simulation", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-                float stiffness = solver.getStiffness();
-                float damping = solver.getDamping();
-                float gravity = solver.getGravityScale();
-                float wind = solver.getWindStrength();
+                int solverMode = useGpuSolver ? 1 : 0;
+                if (!gpuAvailable) {
+                    solverMode = 0;
+                }
+                ImGui::Text("Solver Backend");
+                ImGui::RadioButton("CPU", &solverMode, 0);
+                ImGui::SameLine();
+                const bool gpuSelect = ImGui::RadioButton("GPU", &solverMode, 1);
+                (void)gpuSelect;
+                if (solverMode == 1 && gpuAvailable) {
+                    useGpuSolver = true;
+                } else if (solverMode == 0) {
+                    useGpuSolver = false;
+                }
+
+                if (!gpuAvailable) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "GPU solver unavailable");
+                    if (!gpuInitError.empty()) {
+                        ImGui::TextWrapped("%s", gpuInitError.c_str());
+                    }
+                }
+                ImGui::Separator();
 
                 if (ImGui::SliderFloat("Stiffness", &stiffness, 20.0f, 1200.0f)) {
-                    solver.setStiffness(stiffness);
+                    cpuSolver.setStiffness(stiffness);
+                    if (gpuAvailable) {
+                        gpuSolver->setStiffness(stiffness);
+                    }
                 }
                 if (ImGui::SliderFloat("Damping", &damping, 0.01f, 2.0f)) {
-                    solver.setDamping(damping);
+                    cpuSolver.setDamping(damping);
+                    if (gpuAvailable) {
+                        gpuSolver->setDamping(damping);
+                    }
                 }
                 if (ImGui::SliderFloat("Gravity", &gravity, 0.0f, 3.0f)) {
-                    solver.setGravityScale(gravity);
+                    cpuSolver.setGravityScale(gravity);
+                    if (gpuAvailable) {
+                        gpuSolver->setGravityScale(gravity);
+                    }
                 }
                 if (ImGui::SliderFloat("Wind", &wind, -8.0f, 8.0f)) {
-                    solver.setWindStrength(wind);
+                    cpuSolver.setWindStrength(wind);
+                    if (gpuAvailable) {
+                        gpuSolver->setWindStrength(wind);
+                    }
                 }
 
+                ImGui::Separator();
+                ImGui::Text("Render Solver: %s", useGpuSolver && gpuAvailable ? "GPU" : "CPU");
+                ImGui::Text("Step CPU: %.3f ms", cpuStepMs);
+                if (gpuAvailable) {
+                    ImGui::Text("Step GPU: %.3f ms", gpuStepMs);
+                    ImGui::Text("CPU/GPU RMSE: %.6f", cpuGpuRmse);
+                }
                 ImGui::Separator();
                 ImGui::Text("P: Pause  R: Reset  F1: Wireframe  H: Toggle UI");
                 ImGui::Text("Right Mouse: Look Around");
@@ -400,23 +490,75 @@ int main() {
 
             if (leftDown && !leftMouseHeld && !mouseCapturedByUi && !rightDown) {
                 const Ray ray = screenPointToRay(mouseX, mouseY, fbWidth, fbHeight, camera);
-                solver.beginDrag(ray.origin, ray.direction, 0.18f);
+                cpuSolver.beginDrag(ray.origin, ray.direction, 0.18f);
+                if (gpuAvailable) {
+                    gpuSolver->beginDrag(ray.origin, ray.direction, 0.18f);
+                }
             }
-            if (leftDown && solver.isDragging() && !mouseCapturedByUi) {
+            if (leftDown && !mouseCapturedByUi && (cpuSolver.isDragging() || (gpuAvailable && gpuSolver->isDragging()))) {
                 const Ray ray = screenPointToRay(mouseX, mouseY, fbWidth, fbHeight, camera);
-                solver.updateDragFromRay(ray.origin, ray.direction);
+                cpuSolver.updateDragFromRay(ray.origin, ray.direction);
+                if (gpuAvailable) {
+                    gpuSolver->updateDragFromRay(ray.origin, ray.direction);
+                }
             }
-            if ((!leftDown || mouseCapturedByUi) && solver.isDragging()) {
-                solver.endDrag();
+            if ((!leftDown || mouseCapturedByUi) && (cpuSolver.isDragging() || (gpuAvailable && gpuSolver->isDragging()))) {
+                cpuSolver.endDrag();
+                if (gpuAvailable) {
+                    gpuSolver->endDrag();
+                }
             }
 
             leftMouseHeld = leftDown;
 
             camera.processKeyboard(window, dt);
             if (!paused) {
-                solver.step(dt);
+                const auto cpuStart = std::chrono::high_resolution_clock::now();
+                cpuSolver.step(dt);
+                const auto cpuEnd = std::chrono::high_resolution_clock::now();
+                cpuStepMs = std::chrono::duration<double, std::milli>(cpuEnd - cpuStart).count();
+
+                if (gpuAvailable) {
+                    const auto gpuStart = std::chrono::high_resolution_clock::now();
+                    gpuSolver->step(dt);
+                    const auto gpuEnd = std::chrono::high_resolution_clock::now();
+                    gpuStepMs = std::chrono::duration<double, std::milli>(gpuEnd - gpuStart).count();
+                }
             }
-            clothMesh.updatePositions(solver.getPositions());
+
+            const std::vector<glm::vec3>& renderPositions =
+                (useGpuSolver && gpuAvailable) ? gpuSolver->getPositions() : cpuSolver.getPositions();
+            clothMesh.updatePositions(renderPositions);
+
+            if (gpuAvailable) {
+                const std::vector<glm::vec3>& cpuPositions = cpuSolver.getPositions();
+                const std::vector<glm::vec3>& gpuPositions = gpuSolver->getPositions();
+                double sq = 0.0;
+                const std::size_t n = cpuPositions.size();
+                for (std::size_t i = 0; i < n; ++i) {
+                    const glm::vec3 d = cpuPositions[i] - gpuPositions[i];
+                    sq += static_cast<double>(glm::dot(d, d));
+                }
+                cpuGpuRmse = n > 0 ? std::sqrt(sq / static_cast<double>(n)) : 0.0;
+
+                if (!paused) {
+                    compareAccumSec += dt;
+                    compareAccumCpuMs += cpuStepMs;
+                    compareAccumGpuMs += gpuStepMs;
+                    compareAccumRmse += cpuGpuRmse;
+                    compareSamples += 1;
+                    if (compareAccumSec >= 1.0 && compareSamples > 0) {
+                        std::cout << "[SolverCompare] avg CPU " << (compareAccumCpuMs / compareSamples)
+                                  << " ms | avg GPU " << (compareAccumGpuMs / compareSamples)
+                                  << " ms | avg RMSE " << (compareAccumRmse / compareSamples) << '\n';
+                        compareAccumSec = 0.0;
+                        compareAccumCpuMs = 0.0;
+                        compareAccumGpuMs = 0.0;
+                        compareAccumRmse = 0.0;
+                        compareSamples = 0;
+                    }
+                }
+            }
 
             const glm::vec3 sunlightDirection = glm::normalize(glm::vec3(-0.62f, -1.0f, -0.42f));
             const glm::vec3 lightDirForShading = -sunlightDirection;

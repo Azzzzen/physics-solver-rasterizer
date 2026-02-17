@@ -47,6 +47,7 @@ add_executable(cloth_rasterizer
     src/ObjLoader.cpp
     src/Shader.cpp
     src/PhysicsSolver.cpp
+    src/GpuPhysicsSolver.cpp
     thirdparty/imgui/imgui.cpp
     thirdparty/imgui/imgui_draw.cpp
     thirdparty/imgui/imgui_tables.cpp
